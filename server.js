@@ -34,7 +34,6 @@ function fetchFMP(path, callback) {
 }
 
 // ── FMP MARKET CONDITIONS ──
-// Fetches all Minervini market timing signals in parallel
 function fetchFMPMarketConditions(callback) {
   if (!FMP_API_KEY) {
     callback({ error: 'FMP_API_KEY not configured' });
@@ -43,48 +42,49 @@ function fetchFMPMarketConditions(callback) {
 
   const result = {};
   let pending = 4;
-  const done = () => { if (--pending === 0) callback(result); };
+  const done = () => { if (--pending === 0) {
+    console.log('FMP result:', JSON.stringify(result).slice(0, 500));
+    callback(result);
+  }};
 
-  // 1. SPY, QQQ, IWM quotes — price and % change
+  // 1. SPY, QQQ, IWM quotes
   fetchFMP('/quote/SPY,QQQ,IWM', (err, data) => {
-    if (err) { result.quotesError = err.message; }
-    else if (Array.isArray(data)) {
-      data.forEach(q => {
-        if (q.symbol === 'SPY') result.spy = { price: q.price, change5d: q.changesPercentage, name: q.name };
-        if (q.symbol === 'QQQ') result.qqq = { price: q.price, change5d: q.changesPercentage };
-        if (q.symbol === 'IWM') result.iwm = { price: q.price, change5d: q.changesPercentage };
-      });
+    if (err) { result.quotesError = err.message; console.log('FMP quotes error:', err.message); }
+    else {
+      console.log('FMP quotes raw:', JSON.stringify(data).slice(0, 300));
+      if (Array.isArray(data)) {
+        data.forEach(q => {
+          if (q.symbol === 'SPY') result.spy = { price: q.price, change5d: q.changesPercentage };
+          if (q.symbol === 'QQQ') result.qqq = { price: q.price, change5d: q.changesPercentage };
+          if (q.symbol === 'IWM') result.iwm = { price: q.price, change5d: q.changesPercentage };
+        });
+      } else { result.quotesError = JSON.stringify(data).slice(0, 200); }
     }
     done();
   });
 
-  // 2. SPY 200-day SMA — for market stage (above/below MAs)
+  // 2. SPY 200-day SMA
   fetchFMP('/technical_indicator/daily/SPY?period=200&type=sma', (err, data) => {
-    if (err) { result.smaError = err.message; }
-    else if (Array.isArray(data) && data[0]) {
-      result.spy200sma = data[0].sma;
-      // Also get 50-day from same call by requesting shorter period
-    }
+    if (err) { result.smaError = err.message; console.log('FMP 200sma error:', err.message); }
+    else if (Array.isArray(data) && data[0]) { result.spy200sma = data[0].sma; }
+    else { result.smaError = JSON.stringify(data).slice(0, 100); }
     done();
   });
 
   // 3. SPY 50-day SMA
   fetchFMP('/technical_indicator/daily/SPY?period=50&type=sma', (err, data) => {
-    if (err) { result.sma50Error = err.message; }
-    else if (Array.isArray(data) && data[0]) {
-      result.spy50sma = data[0].sma;
-    }
+    if (err) { result.sma50Error = err.message; console.log('FMP 50sma error:', err.message); }
+    else if (Array.isArray(data) && data[0]) { result.spy50sma = data[0].sma; }
+    else { result.sma50Error = JSON.stringify(data).slice(0, 100); }
     done();
   });
 
-  // 4. VIX quote
+  // 4. VIX
   fetchFMP('/quote/%5EVIX', (err, data) => {
-    if (err) { result.vixError = err.message; }
-    else if (Array.isArray(data) && data[0]) {
-      result.vix = data[0].price;
-    } else if (data && data.price) {
-      result.vix = data.price;
-    }
+    if (err) { result.vixError = err.message; console.log('FMP VIX error:', err.message); }
+    else if (Array.isArray(data) && data[0]) { result.vix = data[0].price; }
+    else if (data && data.price) { result.vix = data.price; }
+    else { result.vixError = JSON.stringify(data).slice(0, 100); }
     done();
   });
 }
