@@ -75,14 +75,22 @@ function fetchFMPMarketConditions(callback) {
   // QQQ
   fetchFMP('/quote?symbol=QQQ', (err, data) => {
     if (err) { result.qqqError = err.message; }
-    else { const q = parseQuote(data, 'QQQ'); if (q) result.qqq = { price: q.price, change5d: q.changesPercentage || q.changePercentage || 0 }; }
+    else {
+      console.log('QQQ raw:', JSON.stringify(data).slice(0,300));
+      const q = parseQuote(data, 'QQQ');
+      if (q) result.qqq = { price: q.price, change5d: q.changesPercentage || q.changePercentage || q.change || 0 };
+    }
     done();
   });
 
   // IWM
   fetchFMP('/quote?symbol=IWM', (err, data) => {
     if (err) { result.iwmError = err.message; }
-    else { const q = parseQuote(data, 'IWM'); if (q) result.iwm = { price: q.price, change5d: q.changesPercentage || q.changePercentage || 0 }; }
+    else {
+      console.log('IWM raw:', JSON.stringify(data).slice(0,300));
+      const q = parseQuote(data, 'IWM');
+      if (q) result.iwm = { price: q.price, change5d: q.changesPercentage || q.changePercentage || q.change || 0 };
+    }
     done();
   });
 
