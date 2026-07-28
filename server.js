@@ -34,7 +34,7 @@ function fetchFMP(path, callback) {
 }
 
 // ── FMP MARKET CONDITIONS ──
-// Single call gets SPY/QQQ/IWM with 50MA and 200MA built in
+// Single quote endpoint covers everything — priceAvg50 and priceAvg200 are built in
 function fetchFMPMarketConditions(callback) {
   if (!FMP_API_KEY) {
     callback({ error: 'FMP_API_KEY not configured' });
@@ -42,48 +42,58 @@ function fetchFMPMarketConditions(callback) {
   }
 
   const result = {};
-  let pending = 2;
+  let pending = 4;
   const done = () => { if (--pending === 0) {
     console.log('FMP result:', JSON.stringify(result).slice(0, 500));
     callback(result);
   }};
 
-  // 1. SPY, QQQ, IWM — quote includes priceAvg50 and priceAvg200 built in
-  fetchFMP('/quote?symbol=SPY,QQQ,IWM', (err, data) => {
-    if (err) { result.quotesError = err.message; console.log('FMP quotes error:', err.message); }
+  const parseQuote = (data, sym) => {
+    const arr = Array.isArray(data) ? data : (data ? [data] : []);
+    return arr.find(q => (q.symbol || q.ticker) === sym) || arr[0] || null;
+  };
+
+  // SPY — includes priceAvg50 and priceAvg200
+  fetchFMP('/quote?symbol=SPY', (err, data) => {
+    if (err) { result.spyError = err.message; }
     else {
-      console.log('FMP quotes raw:', JSON.stringify(data).slice(0, 400));
-      const arr = Array.isArray(data) ? data : (data.quote ? [data.quote] : []);
-      arr.forEach(q => {
-        const sym = q.symbol || q.ticker;
-        const entry = {
-          price: q.price,
-          change5d: q.changesPercentage || q.changePercentage || q.change5dPercentage || 0,
-          priceAvg50: q.priceAvg50,
-          priceAvg200: q.priceAvg200,
-        };
-        if (sym === 'SPY') result.spy = entry;
-        if (sym === 'QQQ') result.qqq = entry;
-        if (sym === 'IWM') result.iwm = entry;
-      });
-      // Calculate SPY regime from built-in MAs
-      if (result.spy && result.spy.priceAvg50 && result.spy.priceAvg200) {
-        const p = result.spy.price, s50 = result.spy.priceAvg50, s200 = result.spy.priceAvg200;
-        if (p > s50 && p > s200) result.spyRegime = 'Above both MAs';
-        else if (p > s200 && p <= s50) result.spyRegime = 'Below 50MA';
-        else result.spyRegime = 'Below both MAs';
-      }
+      console.log('SPY raw:', JSON.stringify(data).slice(0,200));
+      const q = parseQuote(data, 'SPY');
+      if (q) {
+        result.spy = { price: q.price, change5d: q.changesPercentage || q.changePercentage || 0, priceAvg50: q.priceAvg50, priceAvg200: q.priceAvg200 };
+        const p = q.price, s50 = q.priceAvg50, s200 = q.priceAvg200;
+        if (p && s50 && s200) {
+          if (p > s50 && p > s200) result.spyRegime = 'Above both MAs';
+          else if (p > s200 && p <= s50) result.spyRegime = 'Below 50MA';
+          else result.spyRegime = 'Below both MAs';
+        }
+      } else { result.spyError = JSON.stringify(data).slice(0,200); }
     }
     done();
   });
 
-  // 2. VIX — index quote
-  fetchFMP('/index-quote?symbol=%5EVIX', (err, data) => {
-    if (err) { result.vixError = err.message; console.log('FMP VIX error:', err.message); }
+  // QQQ
+  fetchFMP('/quote?symbol=QQQ', (err, data) => {
+    if (err) { result.qqqError = err.message; }
+    else { const q = parseQuote(data, 'QQQ'); if (q) result.qqq = { price: q.price, change5d: q.changesPercentage || q.changePercentage || 0 }; }
+    done();
+  });
+
+  // IWM
+  fetchFMP('/quote?symbol=IWM', (err, data) => {
+    if (err) { result.iwmError = err.message; }
+    else { const q = parseQuote(data, 'IWM'); if (q) result.iwm = { price: q.price, change5d: q.changesPercentage || q.changePercentage || 0 }; }
+    done();
+  });
+
+  // VIX — uses caret symbol, same /stable/quote endpoint
+  fetchFMP('/quote?symbol=^VIX', (err, data) => {
+    if (err) { result.vixError = err.message; }
     else {
-      console.log('FMP VIX raw:', JSON.stringify(data).slice(0, 200));
+      console.log('VIX raw:', JSON.stringify(data).slice(0,200));
       const arr = Array.isArray(data) ? data : (data ? [data] : []);
       if (arr[0]) result.vix = arr[0].price || arr[0].last;
+      else result.vixError = JSON.stringify(data).slice(0,200);
     }
     done();
   });
