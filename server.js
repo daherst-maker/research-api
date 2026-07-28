@@ -9,7 +9,7 @@ const FMP_API_KEY = process.env.FMP_API_KEY || '';
 // ── FMP FETCHER ──
 function fetchFMP(path, callback) {
   const sep = path.includes('?') ? '&' : '?';
-  const fullPath = `/api/v3${path}${sep}apikey=${FMP_API_KEY}`;
+  const fullPath = `/stable${path}${sep}apikey=${FMP_API_KEY}`;
 
   const options = {
     hostname: 'financialmodelingprep.com',
@@ -34,6 +34,7 @@ function fetchFMP(path, callback) {
 }
 
 // ── FMP MARKET CONDITIONS ──
+// Single call gets SPY/QQQ/IWM with 50MA and 200MA built in
 function fetchFMPMarketConditions(callback) {
   if (!FMP_API_KEY) {
     callback({ error: 'FMP_API_KEY not configured' });
@@ -41,50 +42,49 @@ function fetchFMPMarketConditions(callback) {
   }
 
   const result = {};
-  let pending = 4;
+  let pending = 2;
   const done = () => { if (--pending === 0) {
     console.log('FMP result:', JSON.stringify(result).slice(0, 500));
     callback(result);
   }};
 
-  // 1. SPY, QQQ, IWM quotes
-  fetchFMP('/quote/SPY,QQQ,IWM', (err, data) => {
+  // 1. SPY, QQQ, IWM — quote includes priceAvg50 and priceAvg200 built in
+  fetchFMP('/quote?symbol=SPY,QQQ,IWM', (err, data) => {
     if (err) { result.quotesError = err.message; console.log('FMP quotes error:', err.message); }
     else {
-      console.log('FMP quotes raw:', JSON.stringify(data).slice(0, 300));
-      if (Array.isArray(data)) {
-        data.forEach(q => {
-          if (q.symbol === 'SPY') result.spy = { price: q.price, change5d: q.changesPercentage };
-          if (q.symbol === 'QQQ') result.qqq = { price: q.price, change5d: q.changesPercentage };
-          if (q.symbol === 'IWM') result.iwm = { price: q.price, change5d: q.changesPercentage };
-        });
-      } else { result.quotesError = JSON.stringify(data).slice(0, 200); }
+      console.log('FMP quotes raw:', JSON.stringify(data).slice(0, 400));
+      const arr = Array.isArray(data) ? data : (data.quote ? [data.quote] : []);
+      arr.forEach(q => {
+        const sym = q.symbol || q.ticker;
+        const entry = {
+          price: q.price,
+          change5d: q.changesPercentage || q.changePercentage || q.change5dPercentage || 0,
+          priceAvg50: q.priceAvg50,
+          priceAvg200: q.priceAvg200,
+        };
+        if (sym === 'SPY') result.spy = entry;
+        if (sym === 'QQQ') result.qqq = entry;
+        if (sym === 'IWM') result.iwm = entry;
+      });
+      // Calculate SPY regime from built-in MAs
+      if (result.spy && result.spy.priceAvg50 && result.spy.priceAvg200) {
+        const p = result.spy.price, s50 = result.spy.priceAvg50, s200 = result.spy.priceAvg200;
+        if (p > s50 && p > s200) result.spyRegime = 'Above both MAs';
+        else if (p > s200 && p <= s50) result.spyRegime = 'Below 50MA';
+        else result.spyRegime = 'Below both MAs';
+      }
     }
     done();
   });
 
-  // 2. SPY 200-day SMA
-  fetchFMP('/technical_indicator/daily/SPY?period=200&type=sma', (err, data) => {
-    if (err) { result.smaError = err.message; console.log('FMP 200sma error:', err.message); }
-    else if (Array.isArray(data) && data[0]) { result.spy200sma = data[0].sma; }
-    else { result.smaError = JSON.stringify(data).slice(0, 100); }
-    done();
-  });
-
-  // 3. SPY 50-day SMA
-  fetchFMP('/technical_indicator/daily/SPY?period=50&type=sma', (err, data) => {
-    if (err) { result.sma50Error = err.message; console.log('FMP 50sma error:', err.message); }
-    else if (Array.isArray(data) && data[0]) { result.spy50sma = data[0].sma; }
-    else { result.sma50Error = JSON.stringify(data).slice(0, 100); }
-    done();
-  });
-
-  // 4. VIX
-  fetchFMP('/quote/%5EVIX', (err, data) => {
+  // 2. VIX — index quote
+  fetchFMP('/index-quote?symbol=%5EVIX', (err, data) => {
     if (err) { result.vixError = err.message; console.log('FMP VIX error:', err.message); }
-    else if (Array.isArray(data) && data[0]) { result.vix = data[0].price; }
-    else if (data && data.price) { result.vix = data.price; }
-    else { result.vixError = JSON.stringify(data).slice(0, 100); }
+    else {
+      console.log('FMP VIX raw:', JSON.stringify(data).slice(0, 200));
+      const arr = Array.isArray(data) ? data : (data ? [data] : []);
+      if (arr[0]) result.vix = arr[0].price || arr[0].last;
+    }
     done();
   });
 }
