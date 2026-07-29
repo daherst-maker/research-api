@@ -68,22 +68,35 @@ function fetchFMP(path, callback) {
 
 function fmpMarketConditions(callback) {
   const result = {};
-  let pending = 4;
+  let pending = 5;
   const done = () => { if (--pending === 0) {
-    // Compute regime algorithmically — never trust provider's label
+    // ── ALGORITHMIC STAGE CALCULATION ──
     if (result.spy) {
-      const p = result.spy.price, s50 = result.spy.priceAvg50, s200 = result.spy.priceAvg200;
-      if (p && s50 && s200) {
+      const p = result.spy.price;
+      const s50 = result.spy.priceAvg50;
+      const s200 = result.spy.priceAvg200;
+      // Calculate 150MA approximation from 50MA and 200MA
+      // True 150MA not in quote — use SMA endpoint result if available
+      const s150 = result.spy150sma || null;
+
+      result.spy.aboveMA200 = s200 ? p > s200 : null;
+      result.spy.aboveMA150 = s150 ? p > s150 : null;
+      result.spy.aboveMA50 = s50 ? p > s50 : null;
+      result.spy.ma150AboveMA200 = (s150 && s200) ? s150 > s200 : null;
+      result.spy.ma200Slope = result.spy200slope || null; // rising/flat/falling
+
+      // SPY regime
+      if (s50 && s200) {
         if (p > s50 && p > s200) result.spyRegime = 'Above both MAs';
         else if (p > s200 && p <= s50) result.spyRegime = 'Below 50MA';
         else result.spyRegime = 'Below both MAs';
       }
     }
-    console.log('Market conditions:', JSON.stringify(result).slice(0, 400));
+    console.log('Market conditions:', JSON.stringify(result).slice(0, 500));
     callback(result);
   }};
 
-  // SPY quote — has priceAvg50, priceAvg200 built in
+  // SPY quote — price, priceAvg50, priceAvg200
   fetchFMP('/quote?symbol=SPY', (err, data) => {
     if (err) { result.spyError = err.message; }
     else {
@@ -120,9 +133,32 @@ function fmpMarketConditions(callback) {
     done();
   });
 
-  // Sector performance snapshot
-  fetchFMP('/sector-performance-snapshot', (err, data) => {
-    if (!err && Array.isArray(data)) result.sectorSnapshot = data;
+  // 150-day SMA for SPY — needed for Stage 2 confirmation
+  fetchFMP('/technical-indicators/sma?symbol=SPY&periodLength=150&timeframe=1day', (err, data) => {
+    if (err) { result.sma150Error = err.message; }
+    else {
+      const arr = Array.isArray(data) ? data : [];
+      if (arr[0] && arr[0].sma) { if (!result.spy) result.spy = {}; result.spy.priceAvg150 = arr[0].sma; result.spy150sma = arr[0].sma; }
+    }
+    done();
+  });
+
+  // 200-day SMA history — last 25 days to calculate slope
+  fetchFMP('/technical-indicators/sma?symbol=SPY&periodLength=200&timeframe=1day', (err, data) => {
+    if (err) { result.smaHistError = err.message; }
+    else {
+      const arr = Array.isArray(data) ? data : [];
+      if (arr.length >= 2) {
+        const latest = arr[0].sma;
+        // Compare to 20 trading days ago
+        const older = arr[Math.min(19, arr.length-1)].sma;
+        const slopePct = ((latest - older) / older) * 100;
+        result.spy200slope = slopePct > 0.1 ? 'Rising' : slopePct < -0.1 ? 'Falling' : 'Flat';
+        result.spy200slopeValue = slopePct.toFixed(3);
+        if (!result.spy) result.spy = {};
+        result.spy.ma200Slope = result.spy200slope;
+      }
+    }
     done();
   });
 }
