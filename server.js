@@ -101,7 +101,7 @@ function fmpMarketConditions(callback) {
       const arr = Array.isArray(data) ? data : [data];
       arr.forEach(q => {
         const c = q['5D'] || 0;
-        if (q.symbol === 'SPY') { if (!result.spy) result.spy = {}; result.spy.change5d = c; }
+        if (q.symbol === 'SPY') { result.spy = Object.assign(result.spy || {}, { change5d: c }); }
         if (q.symbol === 'QQQ') result.qqq = { change5d: c };
         if (q.symbol === 'IWM') result.iwm = { change5d: c };
       });
