@@ -3,7 +3,6 @@ const http = require('http');
 
 const PORT = process.env.PORT || 3000;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
-const UW_API_KEY = process.env.UW_API_KEY || '';
 const FMP_API_KEY = process.env.FMP_API_KEY || '';
 
 // ════════════════════════════════════════════════════════════════
@@ -24,12 +23,15 @@ const FMP_API_KEY = process.env.FMP_API_KEY || '';
 // }
 //
 // stockData(ticker) → {
-//   quote: { price, change, changePercent, volume, avgVolume,
-//            high52, low52, marketCap, priceAvg50, priceAvg200 },
-//   priceChange: { 1D, 5D, 1M, 3M, 6M, 1Y },
-//   incomeStatements: [...],   // last 8 quarters
-//   keyMetrics: [...],         // last 4 quarters (ROE, margins)
-//   weeklyCandles: [...]       // last 52 trading days
+//   quote: { price, change, changePercentage, volume, avgVolume,
+//            yearHigh, yearLow, marketCap, priceAvg50, priceAvg200,
+//            earningsAnnouncement, eps, pe }
+//   priceChange: { 1D, 5D, 1M, 3M, 6M, 1Y }
+//   incomeStatements: [...],   // last 8 quarters, newest first
+//   keyMetrics: [...],         // last 4 quarters (roe, margins)
+//   sma150: number,            // 150-day SMA — needed for full Stage 2 confirmation
+//   dailyCandles: [...],       // last 60 trading days, newest first
+//   weeklyCandles: [...]       // aggregated weekly OHLCV, ~last 60 weeks, newest first
 // }
 // ════════════════════════════════════════════════════════════════
 
@@ -163,9 +165,39 @@ function fmpMarketConditions(callback) {
   });
 }
 
+function aggregateWeeklyCandles(daily) {
+  // daily assumed newest-first (FMP default). Returns weekly OHLCV, newest-first.
+  if (!Array.isArray(daily) || daily.length === 0) return [];
+  const sorted = daily.slice().sort((a, b) => new Date(b.date) - new Date(a.date));
+  const weeks = [];
+  let current = null;
+  let currentWeekKey = null;
+  for (const d of sorted) {
+    if (!d || !d.date) continue;
+    const dt = new Date(d.date);
+    const day = dt.getUTCDay(); // 0=Sun..6=Sat
+    const diffToMonday = (day === 0 ? -6 : 1) - day;
+    const monday = new Date(dt);
+    monday.setUTCDate(dt.getUTCDate() + diffToMonday);
+    const weekKey = monday.toISOString().slice(0, 10);
+    if (weekKey !== currentWeekKey) {
+      if (current) weeks.push(current);
+      current = { weekStart: weekKey, open: d.open, high: d.high, low: d.low, close: d.close, volume: d.volume || 0 };
+      currentWeekKey = weekKey;
+    } else {
+      current.high = Math.max(current.high, d.high);
+      current.low = Math.min(current.low, d.low);
+      current.open = d.open; // overwritten each older day seen — ends on oldest day's open (correct)
+      current.volume += (d.volume || 0);
+    }
+  }
+  if (current) weeks.push(current);
+  return weeks;
+}
+
 function fmpStockData(ticker, callback) {
   const result = { ticker };
-  let pending = 5;
+  let pending = 6;
   const done = () => { if (--pending === 0) callback(result); };
 
   fetchFMP(`/quote?symbol=${ticker}`, (err, data) => {
@@ -192,11 +224,24 @@ function fmpStockData(ticker, callback) {
     done();
   });
 
+  // 150-day SMA — not in the quote endpoint, needed for full Stage 2 confirmation
+  fetchFMP(`/technical-indicators/sma?symbol=${ticker}&periodLength=150&timeframe=1day`, (err, data) => {
+    if (err) result.sma150Error = err.message;
+    else {
+      const arr = Array.isArray(data) ? data : [];
+      if (arr[0] && arr[0].sma) result.sma150 = arr[0].sma;
+    }
+    done();
+  });
+
+  // Enough daily history for 52-week high/low, 200MA confirmation, and ~a year of weekly VCP context
   fetchFMP(`/historical-price-eod/full?symbol=${ticker}`, (err, data) => {
     if (err) result.historyError = err.message;
     else {
       const arr = Array.isArray(data) ? data : (data && data.historical ? data.historical : []);
-      result.weeklyCandles = arr.slice(0, 52);
+      const daily = arr.slice(0, 400);
+      result.dailyCandles = daily.slice(0, 60); // recent daily detail for pivot dial-in
+      result.weeklyCandles = aggregateWeeklyCandles(daily).slice(0, 60); // ~a year of weekly OHLCV
     }
     done();
   });
@@ -218,29 +263,6 @@ function getStockData(ticker, callback) {
   if (ACTIVE_PROVIDER === 'fmp') return fmpStockData(ticker, callback);
   // if (ACTIVE_PROVIDER === 'polygon') return polygonStockData(ticker, callback);
   callback({ error: `Unknown provider: ${ACTIVE_PROVIDER}` });
-}
-
-
-// ════════════════════════════════════════════════════════════════
-// UNUSUAL WHALES (options flow — separate from market data)
-// ════════════════════════════════════════════════════════════════
-
-function fetchUW(path, callback) {
-  if (!UW_API_KEY) { callback(null, { error: 'UW_API_KEY not configured', configured: false }); return; }
-  const options = {
-    hostname: 'api.unusualwhales.com', path,
-    method: 'GET',
-    headers: { 'Authorization': `Bearer ${UW_API_KEY}`, 'Accept': 'application/json' },
-    timeout: 15000,
-  };
-  const req = https.request(options, (res) => {
-    let data = '';
-    res.on('data', chunk => data += chunk);
-    res.on('end', () => { try { callback(null, JSON.parse(data)); } catch(e) { callback(null, { error: 'Parse error' }); } });
-  });
-  req.on('error', err => callback(err, null));
-  req.on('timeout', () => { req.destroy(); callback(new Error('UW timed out'), null); });
-  req.end();
 }
 
 
@@ -272,30 +294,6 @@ const server = http.createServer((req, res) => {
   const stockMatch = req.url.match(/^\/fmp\/stock\/([A-Za-z]{1,10})$/i);
   if (req.method === 'GET' && stockMatch) {
     getStockData(stockMatch[1].toUpperCase(), json);
-    return;
-  }
-
-  // ── GET /uw/status ──
-  if (req.method === 'GET' && req.url === '/uw/status') {
-    json({ configured: !!UW_API_KEY, message: UW_API_KEY ? 'Unusual Whales connected' : 'UW_API_KEY not set' });
-    return;
-  }
-
-  // ── GET /uw/ticker/:ticker ──
-  const uwMatch = req.url.match(/^\/uw\/ticker\/([A-Za-z]{1,10})$/i);
-  if (req.method === 'GET' && uwMatch) {
-    const ticker = uwMatch[1].toUpperCase();
-    const results = { ticker, configured: !!UW_API_KEY, flow: null, darkPool: null, errors: [] };
-    let pending = 2;
-    const done = () => { if (--pending === 0) json(results); };
-    fetchUW(`/api/stock/${ticker}/flow`, (err, data) => { if (err) results.errors.push(err.message); else results.flow = data; done(); });
-    fetchUW(`/api/stock/${ticker}/dark-pool`, (err, data) => { if (err) results.errors.push(err.message); else results.darkPool = data; done(); });
-    return;
-  }
-
-  // ── GET /uw/alerts ──
-  if (req.method === 'GET' && req.url === '/uw/alerts') {
-    fetchUW('/api/option-trades/flow-alerts', (err, data) => json(err ? { error: err.message } : data));
     return;
   }
 
@@ -340,5 +338,4 @@ server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Provider: ${ACTIVE_PROVIDER}`);
   console.log(`FMP: ${FMP_API_KEY ? 'CONNECTED' : 'NOT CONFIGURED'}`);
-  console.log(`Unusual Whales: ${UW_API_KEY ? 'CONNECTED' : 'NOT CONFIGURED'}`);
 });
