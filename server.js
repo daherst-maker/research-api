@@ -247,6 +247,25 @@ function fmpStockData(ticker, callback) {
   });
 }
 
+// Real earnings calendar — replaces web-search guessing with an authoritative date/ticker list.
+// No LLM interpretation needed to know who reports when.
+function fmpEarningsCalendar(from, to, callback) {
+  fetchFMP(`/earnings-calendar?from=${from}&to=${to}`, (err, data) => {
+    if (err) { callback({ error: err.message }); return; }
+    callback({ earnings: Array.isArray(data) ? data : [] });
+  });
+}
+
+// Batch quotes for multiple tickers in one call — used to refresh position prices
+// with real numbers instead of relying on whatever was last manually saved.
+function fmpBatchQuote(tickers, callback) {
+  if (!tickers || !tickers.length) { callback({ quotes: [] }); return; }
+  fetchFMP(`/quote?symbol=${tickers.join(',')}`, (err, data) => {
+    if (err) { callback({ error: err.message }); return; }
+    callback({ quotes: Array.isArray(data) ? data : (data ? [data] : []) });
+  });
+}
+
 
 // ════════════════════════════════════════════════════════════════
 // PROVIDER ROUTER
@@ -294,6 +313,24 @@ const server = http.createServer((req, res) => {
   const stockMatch = req.url.match(/^\/fmp\/stock\/([A-Za-z]{1,10})$/i);
   if (req.method === 'GET' && stockMatch) {
     getStockData(stockMatch[1].toUpperCase(), json);
+    return;
+  }
+
+  // ── GET /fmp/earnings-calendar?from=YYYY-MM-DD&to=YYYY-MM-DD ──
+  if (req.method === 'GET' && req.url.startsWith('/fmp/earnings-calendar')) {
+    const qs = new URLSearchParams(req.url.split('?')[1] || '');
+    const from = qs.get('from');
+    const to = qs.get('to');
+    if (!from || !to) { json({ error: 'from and to query params required (YYYY-MM-DD)' }); return; }
+    fmpEarningsCalendar(from, to, json);
+    return;
+  }
+
+  // ── GET /fmp/quote?tickers=AAPL,MSFT,VOYG ──
+  if (req.method === 'GET' && req.url.startsWith('/fmp/quote')) {
+    const qs = new URLSearchParams(req.url.split('?')[1] || '');
+    const tickers = (qs.get('tickers') || '').split(',').map(t => t.trim().toUpperCase()).filter(Boolean).slice(0, 20);
+    fmpBatchQuote(tickers, json);
     return;
   }
 
