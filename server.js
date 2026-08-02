@@ -197,12 +197,24 @@ function aggregateWeeklyCandles(daily) {
 
 function fmpStockData(ticker, callback) {
   const result = { ticker };
-  let pending = 6;
+  let pending = 8;
   const done = () => { if (--pending === 0) callback(result); };
 
   fetchFMP(`/quote?symbol=${ticker}`, (err, data) => {
     if (err) result.quoteError = err.message;
     else { const arr = Array.isArray(data) ? data : [data]; result.quote = arr[0] || null; }
+    done();
+  });
+
+  // Official sector/industry classification — needed to check sector leadership deterministically
+  // rather than asking the model to guess which sector a ticker belongs to.
+  fetchFMP(`/profile?symbol=${ticker}`, (err, data) => {
+    if (err) result.profileError = err.message;
+    else {
+      const arr = Array.isArray(data) ? data : [data];
+      const p = arr[0] || null;
+      if (p) { result.sector = p.sector || null; result.industry = p.industry || null; }
+    }
     done();
   });
 
@@ -230,6 +242,25 @@ function fmpStockData(ticker, callback) {
     else {
       const arr = Array.isArray(data) ? data : [];
       if (arr[0] && arr[0].sma) result.sma150 = arr[0].sma;
+    }
+    done();
+  });
+
+  // The stock's OWN 200-day MA slope — Minervini Trend Template criterion #3 requires the
+  // stock's own 200MA to be trending up for at least a month, not just the market's.
+  fetchFMP(`/technical-indicators/sma?symbol=${ticker}&periodLength=200&timeframe=1day`, (err, data) => {
+    if (err) result.sma200SlopeError = err.message;
+    else {
+      const arr = Array.isArray(data) ? data : [];
+      if (arr.length >= 2) {
+        const latest = arr[0].sma;
+        const older = arr[Math.min(19, arr.length - 1)].sma;
+        if (latest && older) {
+          const slopePct = ((latest - older) / older) * 100;
+          result.sma200Slope = slopePct > 0.1 ? 'Rising' : slopePct < -0.1 ? 'Falling' : 'Flat';
+          result.sma200SlopeValue = slopePct.toFixed(3);
+        }
+      }
     }
     done();
   });
