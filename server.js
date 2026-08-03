@@ -70,30 +70,52 @@ function fetchFMP(path, callback) {
 
 function fmpMarketConditions(callback) {
   const result = {};
-  let pending = 5;
+  let pending = 8;
   const done = () => { if (--pending === 0) {
-    // ── ALGORITHMIC STAGE CALCULATION ──
+    // ── ALGORITHMIC STAGE CALCULATION — SPY ──
     if (result.spy) {
       const p = result.spy.price;
       const s50 = result.spy.priceAvg50;
       const s200 = result.spy.priceAvg200;
-      // Calculate 150MA approximation from 50MA and 200MA
-      // True 150MA not in quote — use SMA endpoint result if available
       const s150 = result.spy150sma || null;
 
       result.spy.aboveMA200 = s200 ? p > s200 : null;
       result.spy.aboveMA150 = s150 ? p > s150 : null;
       result.spy.aboveMA50 = s50 ? p > s50 : null;
       result.spy.ma150AboveMA200 = (s150 && s200) ? s150 > s200 : null;
-      result.spy.ma200Slope = result.spy200slope || null; // rising/flat/falling
+      result.spy.ma200Slope = result.spy200slope || null;
 
-      // SPY regime
       if (s50 && s200) {
         if (p > s50 && p > s200) result.spyRegime = 'Above both MAs';
         else if (p > s200 && p <= s50) result.spyRegime = 'Below 50MA';
         else result.spyRegime = 'Below both MAs';
       }
     }
+
+    // ── ALGORITHMIC STAGE CALCULATION — QQQ ──
+    // Minervini treats Nasdaq with equal weight to SPY, and growth leaders often transition
+    // to Stage 2 weeks before the broader index reflects it. Same full MA treatment as SPY,
+    // not just a lagging 5-day % change.
+    if (result.qqq) {
+      const p = result.qqq.price;
+      const s50 = result.qqq.priceAvg50;
+      const s200 = result.qqq.priceAvg200;
+      const s150 = result.qqq150sma || null;
+
+      result.qqq.aboveMA200 = s200 ? p > s200 : null;
+      result.qqq.aboveMA150 = s150 ? p > s150 : null;
+      result.qqq.aboveMA50 = s50 ? p > s50 : null;
+      result.qqq.ma150AboveMA200 = (s150 && s200) ? s150 > s200 : null;
+      result.qqq.ma200Slope = result.qqq200slope || null;
+      if (s150) result.qqq.priceAvg150 = s150;
+
+      if (s50 && s200) {
+        if (p > s50 && p > s200) result.qqqRegime = 'Above both MAs';
+        else if (p > s200 && p <= s50) result.qqqRegime = 'Below 50MA';
+        else result.qqqRegime = 'Below both MAs';
+      }
+    }
+
     console.log('Market conditions:', JSON.stringify(result).slice(0, 500));
     callback(result);
   }};
@@ -109,6 +131,17 @@ function fmpMarketConditions(callback) {
     done();
   });
 
+  // QQQ quote — price, priceAvg50, priceAvg200 (same treatment as SPY, not just 5-day change)
+  fetchFMP('/quote?symbol=QQQ', (err, data) => {
+    if (err) { result.qqqError = err.message; }
+    else {
+      const q = Array.isArray(data) ? data[0] : data;
+      if (q && q.price) result.qqq = { price: q.price, priceAvg50: q.priceAvg50, priceAvg200: q.priceAvg200 };
+      else result.qqqError = JSON.stringify(data).slice(0, 150);
+    }
+    done();
+  });
+
   // 5-day price changes for SPY, QQQ, IWM
   fetchFMP('/stock-price-change?symbol=SPY,QQQ,IWM', (err, data) => {
     if (err) { result.changeError = err.message; }
@@ -117,7 +150,7 @@ function fmpMarketConditions(callback) {
       arr.forEach(q => {
         const c = q['5D'] || 0;
         if (q.symbol === 'SPY') { result.spy = Object.assign(result.spy || {}, { change5d: c }); }
-        if (q.symbol === 'QQQ') result.qqq = { change5d: c };
+        if (q.symbol === 'QQQ') { result.qqq = Object.assign(result.qqq || {}, { change5d: c }); }
         if (q.symbol === 'IWM') result.iwm = { change5d: c };
       });
     }
@@ -145,20 +178,45 @@ function fmpMarketConditions(callback) {
     done();
   });
 
-  // 200-day SMA history — last 25 days to calculate slope
+  // 150-day SMA for QQQ — same treatment as SPY
+  fetchFMP('/technical-indicators/sma?symbol=QQQ&periodLength=150&timeframe=1day', (err, data) => {
+    if (err) { result.qqqSma150Error = err.message; }
+    else {
+      const arr = Array.isArray(data) ? data : [];
+      if (arr[0] && arr[0].sma) { result.qqq150sma = arr[0].sma; }
+    }
+    done();
+  });
+
+  // 200-day SMA history for SPY — last 25 days to calculate slope
   fetchFMP('/technical-indicators/sma?symbol=SPY&periodLength=200&timeframe=1day', (err, data) => {
     if (err) { result.smaHistError = err.message; }
     else {
       const arr = Array.isArray(data) ? data : [];
       if (arr.length >= 2) {
         const latest = arr[0].sma;
-        // Compare to 20 trading days ago
         const older = arr[Math.min(19, arr.length-1)].sma;
         const slopePct = ((latest - older) / older) * 100;
         result.spy200slope = slopePct > 0.1 ? 'Rising' : slopePct < -0.1 ? 'Falling' : 'Flat';
         result.spy200slopeValue = slopePct.toFixed(3);
         if (!result.spy) result.spy = {};
         result.spy.ma200Slope = result.spy200slope;
+      }
+    }
+    done();
+  });
+
+  // 200-day SMA history for QQQ — same slope treatment as SPY
+  fetchFMP('/technical-indicators/sma?symbol=QQQ&periodLength=200&timeframe=1day', (err, data) => {
+    if (err) { result.qqqSmaHistError = err.message; }
+    else {
+      const arr = Array.isArray(data) ? data : [];
+      if (arr.length >= 2) {
+        const latest = arr[0].sma;
+        const older = arr[Math.min(19, arr.length-1)].sma;
+        const slopePct = ((latest - older) / older) * 100;
+        result.qqq200slope = slopePct > 0.1 ? 'Rising' : slopePct < -0.1 ? 'Falling' : 'Flat';
+        result.qqq200slopeValue = slopePct.toFixed(3);
       }
     }
     done();
@@ -410,6 +468,60 @@ function fmpBatchQuote(tickers, callback) {
   });
 }
 
+// ── MARKET BREADTH — Method 2: Volume-Weighted Batch Quote Check ──
+// A curated high-liquidity, high-quality growth universe (Nasdaq-100-style). This measures
+// how many individual leading stocks are actually participating in a move today — a
+// complementary signal to the SPY/QQQ moving-average Dual-Engine matrix, not a replacement
+// for it. Static list — needs occasional review as index composition drifts.
+const BREADTH_UNIVERSE = [
+  'AAPL','MSFT','NVDA','AVGO','GOOGL','GOOG','AMZN','META','TSLA','COST',
+  'NFLX','AMD','PEP','ADBE','LIN','CSCO','TMUS','QCOM','INTU','TXN',
+  'AMGN','CMCSA','HON','AMAT','BKNG','ISRG','VRTX','PANW','ADP','GILD',
+  'SBUX','MU','ADI','LRCX','MDLZ','REGN','KLAC','PYPL','SNPS','CDNS',
+  'MELI','CRWD','CTAS','MAR','ORLY','ABNB','PCAR','CSX','ROP','NXPI',
+  'FTNT','WDAY','DASH','MNST','AEP','PAYX','ROST','ODFL','KDP','CPRT',
+  'EA','FAST','VRSK','DDOG','TTD','XEL','GEHC','EXC','BKR','CTSH',
+  'IDXX','CCEP','DXCM','ANSS','ON','MCHP','ZS','FANG','TEAM','CSGP',
+  'BIIB','GFS','WBD','ILMN','DLTR','MRVL','LULU','SIRI','WBA','ARM',
+  'APP','MDB','PLTR','SMCI','AXON','CDW','GEN','TTWO','PDD','KHC'
+].filter((t, i, arr) => arr.indexOf(t) === i); // dedupe
+
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
+  return chunks;
+}
+
+function fmpBreadthCheck(callback) {
+  const chunks = chunkArray(BREADTH_UNIVERSE, 50); // chunked well under FMP's batch limits
+  if (!chunks.length) { callback({ advances: 0, declines: 0, total: 0, advanceRatio: null }); return; }
+
+  let pending = chunks.length;
+  let advances = 0, declines = 0, total = 0;
+  const errors = [];
+
+  chunks.forEach(chunk => {
+    fetchFMP(`/quote-short?symbol=${chunk.join(',')}`, (err, data) => {
+      if (err) {
+        errors.push(err.message);
+      } else {
+        const arr = Array.isArray(data) ? data : (data ? [data] : []);
+        arr.forEach(q => {
+          if (q && typeof q.change === 'number') {
+            total++;
+            if (q.change > 0) advances++;
+            else declines++;
+          }
+        });
+      }
+      if (--pending === 0) {
+        const advanceRatio = total > 0 ? +((advances / total) * 100).toFixed(1) : null;
+        callback({ advances, declines, total, advanceRatio, errorCount: errors.length, universeSize: BREADTH_UNIVERSE.length });
+      }
+    });
+  });
+}
+
 
 // ════════════════════════════════════════════════════════════════
 // PROVIDER ROUTER
@@ -482,6 +594,14 @@ const server = http.createServer((req, res) => {
   // meant to be triggered manually and cached client-side, not called per-analysis. ──
   if (req.method === 'GET' && req.url === '/fmp/rs-universe') {
     fmpRSUniverse(json);
+    return;
+  }
+
+  // ── GET /fmp/breadth-check — Method 2: Volume-Weighted Batch Quote Check. Lightweight
+  // (quote-short only, ~2 chunked calls for 100 tickers) — safe to run on every market
+  // conditions fetch, unlike the heavy RS universe build. ──
+  if (req.method === 'GET' && req.url === '/fmp/breadth-check') {
+    fmpBreadthCheck(json);
     return;
   }
 
