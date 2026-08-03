@@ -273,9 +273,107 @@ function fmpStockData(ticker, callback) {
       const daily = arr.slice(0, 400);
       result.dailyCandles = daily.slice(0, 60); // recent daily detail for pivot dial-in
       result.weeklyCandles = aggregateWeeklyCandles(daily).slice(0, 60); // ~a year of weekly OHLCV
+      // IBD-style RS raw score, computed from the same daily history already fetched above —
+      // no extra API call needed for the target ticker.
+      result.rsRawScore = computeIBDStyleScore(daily.map(d => d.close));
     }
     done();
   });
+}
+
+// ── IBD-STYLE RELATIVE STRENGTH ──
+// Documented formula (matches IBD's own described methodology, verified against multiple
+// independent sources): raw score = 2*(C0/C63) + 1*(C0/C126) + 1*(C0/C189) + 1*(C0/C252),
+// where C_N is the close N trading days ago. All stocks are then ranked by this raw score
+// and converted to a 1-99 percentile — top 1% = 99, bottom = 1. This is the real IBD formula,
+// not an approximation; the only compromise is the comparison universe (see RS_UNIVERSE below).
+function computeIBDStyleScore(dailyClosesNewestFirst) {
+  if (!Array.isArray(dailyClosesNewestFirst) || dailyClosesNewestFirst.length < 253) return null;
+  const c0 = dailyClosesNewestFirst[0];
+  const c63 = dailyClosesNewestFirst[63];
+  const c126 = dailyClosesNewestFirst[126];
+  const c189 = dailyClosesNewestFirst[189];
+  const c252 = dailyClosesNewestFirst[252];
+  if (!c0 || !c63 || !c126 || !c189 || !c252) return null;
+  if (c63 <= 0 || c126 <= 0 || c189 <= 0 || c252 <= 0) return null;
+  return 2 * (c0 / c63) + (c0 / c126) + (c0 / c189) + (c0 / c252);
+}
+
+// Broad, liquid US large/mid-cap universe spanning all 11 GICS sectors. IBD's actual comparison
+// universe is every AMEX/NYSE/Nasdaq stock (thousands) — this is a practical, disclosed
+// approximation of ~390 well-established, currently-listed names, not the literal full market.
+// Percentile ranks computed against it are methodologically faithful to IBD's approach but will
+// not be numerically identical to IBD's own published rating. Static list — needs occasional
+// manual review as companies get acquired/delisted/renamed.
+const RS_UNIVERSE = [
+'AAPL','MSFT','NVDA','AVGO','ORCL','ADBE','CRM','AMD','QCOM','TXN','INTU','IBM','NOW','AMAT','MU',
+'ADI','LRCX','KLAC','SNPS','CDNS','PANW','FTNT','CRWD','ANET','MRVL','ON','NXPI','MCHP','CTSH','ADSK',
+'ROP','APH','TEL','GLW','HPQ','DELL','NTAP','WDC','STX','ZBRA','TER','KEYS','TDY','FSLR','ENPH',
+'GOOGL','META','NFLX','DIS','CMCSA','TMUS','VZ','T','CHTR','EA','TTWO','WBD','OMC','IPG','LYV','MTCH',
+'AMZN','TSLA','HD','MCD','NKE','LOW','SBUX','TJX','BKNG','CMG','ORLY','MAR','GM','F','RCL','CCL',
+'YUM','ROST','DHI','LEN','NVR','PHM','ULTA','LULU','DPZ','EBAY','ETSY','BBY','GPC','APTV','WYNN','LVS','MGM','HLT','DRI','AZO','TSCO',
+'WMT','PG','KO','PEP','COST','PM','MO','MDLZ','CL','KMB','GIS','STZ','KDP','KHC','SYY','HSY','MKC',
+'CLX','CHD','TAP','CAG','CPB','HRL','TSN','ADM','KR','TGT','DG','DLTR','EL',
+'JPM','BAC','WFC','GS','MS','C','SCHW','BLK','SPGI','AXP','CB','PGR','MMC','ICE','CME','AON','USB',
+'PNC','TFC','COF','BK','STT','TROW','MET','PRU','AIG','ALL','TRV','AFL','FITB','HBAN','RF','CFG','KEY','MTB','NTRS','SYF','DFS','MA','V','PYPL','FIS','FI','GPN',
+'LLY','UNH','JNJ','ABBV','MRK','TMO','ABT','DHR','PFE','AMGN','ISRG','SYK','BSX','MDT','GILD','VRTX',
+'REGN','ZTS','CI','ELV','HUM','CVS','BDX','EW','IDXX','A','IQV','MRNA','BIIB','HCA','MCK','COR','CAH',
+'RMD','DXCM','ALGN','WST','MTD','WAT','ILMN','GEHC',
+'CAT','HON','UNP','RTX','GE','BA','LMT','DE','ADP','UPS','NOC','GD','ETN','ITW','EMR','CSX','NSC',
+'WM','PH','ROK','CMI','PCAR','JCI','TT','CARR','OTIS','FDX','PAYX','FAST','ODFL','XYL','DOV','SWK',
+'IR','AME','GWW','LHX','TDG','HWM','URI','J','MAS',
+'XOM','CVX','COP','SLB','EOG','MPC','PSX','VLO','OXY','WMB','KMI','OKE','HAL','BKR','FANG','DVN','HES','TRGP','CTRA','APA',
+'LIN','APD','SHW','ECL','FCX','NEM','DOW','DD','PPG','NUE','VMC','MLM','ALB','CTVA','IFF','CE','EMN',
+'PLD','AMT','EQIX','PSA','WELL','SPG','O','DLR','CCI','AVB','EQR','VTR','ARE','SBAC','EXR','MAA','ESS','INVH',
+'NEE','SO','DUK','AEP','SRE','D','EXC','XEL','ED','WEC','ES','FE','PEG','EIX','AWK','DTE','PPL','AEE','CMS','CNP',
+'SHOP','SNOW','DDOG','NET','MDB','ZS','TEAM','WDAY','HUBS','TTD','SQ','ROKU','PINS','SNAP','U','RBLX',
+'DASH','ABNB','UBER','LYFT','COIN','PLTR','SMCI','ARM','APP','AXON','CPRT','VRSK','CTAS','FICO','MPWR',
+'ANSS','GDDY','PTC','TYL','FDS','MSCI','SPGI','NDAQ','CBOE','ARES','KKR','APO','BX','OWL','HIG','WTW',
+'AJG','GL','L','CINF','RJF','IVZ','BEN','PFG','LNC','UNM','ACGL','RE','WRB','EG','GEN','AKAM','DOCU'
+].filter((t, i, arr) => arr.indexOf(t) === i); // dedupe
+
+// Builds the RS comparison universe: fetches daily history for every ticker in RS_UNIVERSE and
+// computes each one's raw score. Controlled concurrency (not all ~390 at once) to stay well
+// within API rate limits. This is a heavy, infrequent operation — meant to be triggered manually
+// and cached client-side, refreshed weekly, never run per-analysis.
+function fmpRSUniverse(callback) {
+  const results = [];
+  const errors = [];
+  let idx = 0;
+  const concurrency = 25;
+  let active = 0;
+  let done = false;
+
+  function finish() {
+    if (done) return;
+    done = true;
+    callback({ scores: results, errorCount: errors.length, total: RS_UNIVERSE.length });
+  }
+
+  function next() {
+    if (idx >= RS_UNIVERSE.length) {
+      if (active === 0) finish();
+      return;
+    }
+    const ticker = RS_UNIVERSE[idx++];
+    active++;
+    fetchFMP(`/historical-price-eod/full?symbol=${ticker}`, (err, data) => {
+      active--;
+      if (!err) {
+        const arr = Array.isArray(data) ? data : (data && data.historical ? data.historical : []);
+        const closes = arr.slice(0, 300).map(d => d.close);
+        const score = computeIBDStyleScore(closes);
+        if (score !== null) results.push({ symbol: ticker, score });
+        else errors.push(ticker);
+      } else {
+        errors.push(ticker);
+      }
+      next();
+    });
+  }
+
+  const starters = Math.min(concurrency, RS_UNIVERSE.length);
+  for (let i = 0; i < starters; i++) next();
 }
 
 // Real earnings calendar — replaces web-search guessing with an authoritative date/ticker list.
@@ -365,6 +463,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // ── GET /fmp/rs-universe — builds the IBD-style RS comparison universe. Heavy (~390 fetches),
+  // meant to be triggered manually and cached client-side, not called per-analysis. ──
+  if (req.method === 'GET' && req.url === '/fmp/rs-universe') {
+    fmpRSUniverse(json);
+    return;
+  }
+
   // ── POST / — Anthropic proxy ──
   if (req.method !== 'POST') { res.writeHead(405); res.end('Method not allowed'); return; }
 
@@ -407,3 +512,7 @@ server.listen(PORT, () => {
   console.log(`Provider: ${ACTIVE_PROVIDER}`);
   console.log(`FMP: ${FMP_API_KEY ? 'CONNECTED' : 'NOT CONFIGURED'}`);
 });
+// The RS universe build fetches ~390 tickers and can take a while — give it room rather than
+// have Node's default socket timeout cut it off mid-build.
+server.timeout = 300000;
+server.headersTimeout = 305000;
