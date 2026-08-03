@@ -247,7 +247,8 @@ function fmpStockData(ticker, callback) {
   });
 
   // The stock's OWN 200-day MA slope — Minervini Trend Template criterion #3 requires the
-  // stock's own 200MA to be trending up for at least a month, not just the market's.
+  // stock's own 200MA to be trending up for at least a month (he prefers 4-5 months), not
+  // just the market's. Also tracks HOW LONG it's been rising, not just the current direction.
   fetchFMP(`/technical-indicators/sma?symbol=${ticker}&periodLength=200&timeframe=1day`, (err, data) => {
     if (err) result.sma200SlopeError = err.message;
     else {
@@ -260,6 +261,20 @@ function fmpStockData(ticker, callback) {
           result.sma200Slope = slopePct > 0.1 ? 'Rising' : slopePct < -0.1 ? 'Falling' : 'Flat';
           result.sma200SlopeValue = slopePct.toFixed(3);
         }
+        // Walk backward in ~21-trading-day (1 month) increments, counting consecutive
+        // months where the 200MA was higher than it was one month before that point.
+        // Stops at the first non-rising month, capped at 6 (Minervini only cares up to ~4-5).
+        let monthsRising = 0;
+        for (let m = 1; m <= 6; m++) {
+          const idxRecent = (m - 1) * 21;
+          const idxPast = m * 21;
+          if (idxPast >= arr.length) break;
+          const recentVal = arr[idxRecent] && arr[idxRecent].sma;
+          const pastVal = arr[idxPast] && arr[idxPast].sma;
+          if (recentVal && pastVal && recentVal > pastVal) monthsRising++;
+          else break;
+        }
+        result.sma200TrendMonths = monthsRising;
       }
     }
     done();
