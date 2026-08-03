@@ -449,6 +449,159 @@ function fmpRSUniverse(callback) {
   for (let i = 0; i < starters; i++) next();
 }
 
+// ── SECTOR → STOCK SCREENER + BROAD TREND TEMPLATE CHECK ──
+// Bridges the manual sector-ranking step to an automated, tokenless broad screen: given up
+// to 3 sector names, pulls all liquid stocks in those sectors from FMP's real screener, then
+// runs the same deterministic Trend Template math already used elsewhere in this app against
+// every one of them — no LLM calls anywhere in this pipeline.
+
+// Canonicalizes free-text sector names (e.g. from a Finviz paste) to FMP's own sector filter
+// values — same keyword-matching approach already used client-side for sector-gate checks.
+const SECTOR_TO_FMP = {
+  'financial': 'Financial Services',
+  'technology': 'Technology',
+  'healthcare': 'Healthcare',
+  'consumer cyclical': 'Consumer Cyclical',
+  'consumer defensive': 'Consumer Defensive',
+  'industrials': 'Industrials',
+  'energy': 'Energy',
+  'basic materials': 'Basic Materials',
+  'real estate': 'Real Estate',
+  'utilities': 'Utilities',
+  'communication services': 'Communication Services'
+};
+const SECTOR_KEYWORDS_SERVER = {
+  'financial': ['financial'], 'technology': ['technology', 'tech'], 'healthcare': ['health'],
+  'consumer cyclical': ['consumer cyclical', 'consumer discretionary'],
+  'consumer defensive': ['consumer defensive', 'consumer staples'],
+  'industrials': ['industrial'], 'energy': ['energy'], 'basic materials': ['materials'],
+  'real estate': ['real estate'], 'utilities': ['utilit'], 'communication services': ['communication']
+};
+function sectorNameToFmpFilter(name) {
+  if (!name) return null;
+  const n = name.toLowerCase().trim();
+  for (const key in SECTOR_KEYWORDS_SERVER) {
+    const kws = SECTOR_KEYWORDS_SERVER[key];
+    for (const kw of kws) { if (n.includes(kw)) return SECTOR_TO_FMP[key]; }
+  }
+  return null; // unrecognized — caller should skip rather than guess
+}
+
+// Fetches all liquid stocks (>$500M market cap, actively trading) across up to 3 sectors from
+// FMP's real company screener, deduped. This is the "broad universe" step — pure data fetch,
+// no LLM involved.
+function fmpSectorScreener(sectorNames, callback) {
+  const fmpSectors = (sectorNames || []).map(sectorNameToFmpFilter).filter(Boolean).slice(0, 3);
+  if (!fmpSectors.length) { callback({ tickers: [], unrecognizedSectors: sectorNames || [] }); return; }
+
+  const allResults = [];
+  let pending = fmpSectors.length;
+  const errors = [];
+
+  fmpSectors.forEach(sector => {
+    const path = `/company-screener?sector=${encodeURIComponent(sector)}&marketCapMoreThan=500000000&volumeMoreThan=100000&isActivelyTrading=true&isEtf=false&isFund=false&country=US&limit=400`;
+    fetchFMP(path, (err, data) => {
+      if (err) {
+        errors.push(`${sector}: ${err.message}`);
+      } else {
+        const arr = Array.isArray(data) ? data : [];
+        arr.forEach(r => {
+          if (r && r.symbol) allResults.push({ symbol: r.symbol, companyName: r.companyName || r.name || '', marketCap: r.marketCap || null, industry: r.industry || '', sector });
+        });
+      }
+      if (--pending === 0) {
+        // Dedupe by symbol (a stock could theoretically appear if sector classification overlaps)
+        const seen = {};
+        const deduped = allResults.filter(r => { if (seen[r.symbol]) return false; seen[r.symbol] = true; return true; });
+        callback({ tickers: deduped, errorCount: errors.length, errors, unrecognizedSectors: (sectorNames || []).filter(s => !sectorNameToFmpFilter(s)) });
+      }
+    });
+  });
+}
+
+// The exact same Minervini Trend Template check already used throughout this app (price above
+// 50/150/200MA, 50MA>150MA>200MA aligned, the stock's own 200MA rising, within 25% of the
+// 52-week high, at least 25% above the 52-week low) — applied broadly, in pure code, with zero
+// LLM/token cost. Mirrors indexStage2Status()'s logic but standalone for server-side reuse.
+function passesTrendTemplate(price, ma50, ma150, ma200, sma200Slope, yearHigh, yearLow) {
+  if (!ma50 || !ma150 || !ma200 || !yearHigh || !yearLow) return { pass: false, reason: 'insufficient data' };
+  const above50 = price > ma50, above150 = price > ma150, above200 = price > ma200;
+  const aligned = ma50 > ma150 && ma150 > ma200;
+  const pctOffHigh = ((yearHigh - price) / yearHigh) * 100;
+  const pctAboveLow = ((price - yearLow) / yearLow) * 100;
+  if (!(above50 && above150 && above200)) return { pass: false, reason: 'price not above all three MAs' };
+  if (!aligned) return { pass: false, reason: '50/150/200MA not aligned in bullish order' };
+  if (sma200Slope !== 'Rising') return { pass: false, reason: `200MA not rising (${sma200Slope || 'unknown'})` };
+  if (pctOffHigh > 25) return { pass: false, reason: `${pctOffHigh.toFixed(1)}% off 52-week high, exceeds 25%` };
+  if (pctAboveLow < 25) return { pass: false, reason: `only ${pctAboveLow.toFixed(1)}% above 52-week low, needs 25%+` };
+  return { pass: true, reason: 'full Trend Template confirmed', pctOffHigh: +pctOffHigh.toFixed(1), pctAboveLow: +pctAboveLow.toFixed(1) };
+}
+
+// Runs the broad Trend Template check across every screened ticker — controlled concurrency,
+// lightweight per-ticker fetch (quote + 150SMA + 200MA slope only, no full candle history needed
+// for this pass). Pure computation throughout; zero LLM calls.
+function fmpBroadTrendTemplateScreen(tickers, callback) {
+  const results = [];
+  const errors = [];
+  let idx = 0;
+  const concurrency = 20;
+  let active = 0;
+  let done = false;
+
+  function finish() {
+    if (done) return;
+    done = true;
+    const passed = results.filter(r => r.pass);
+    callback({ results, passed, total: tickers.length, passedCount: passed.length, errorCount: errors.length });
+  }
+
+  function next() {
+    if (idx >= tickers.length) { if (active === 0) finish(); return; }
+    const t = tickers[idx++];
+    active++;
+    let quote = null, sma150 = null, sma200Slope = null;
+    let pendingFetches = 3;
+    const doneOne = () => {
+      if (--pendingFetches > 0) return;
+      active--;
+      if (!quote || !quote.price) {
+        errors.push(t.symbol);
+      } else {
+        const check = passesTrendTemplate(quote.price, quote.priceAvg50, sma150, quote.priceAvg200, sma200Slope, quote.yearHigh, quote.yearLow);
+        results.push({ symbol: t.symbol, companyName: t.companyName, marketCap: t.marketCap, industry: t.industry, sector: t.sector,
+          price: quote.price, ma50: quote.priceAvg50, ma150: sma150, ma200: quote.priceAvg200,
+          pass: check.pass, reason: check.reason, pctOffHigh: check.pctOffHigh, pctAboveLow: check.pctAboveLow });
+      }
+      next();
+    };
+    fetchFMP(`/quote?symbol=${t.symbol}`, (err, data) => {
+      if (!err) { const q = Array.isArray(data) ? data[0] : data; if (q && q.price) quote = q; }
+      doneOne();
+    });
+    fetchFMP(`/technical-indicators/sma?symbol=${t.symbol}&periodLength=150&timeframe=1day`, (err, data) => {
+      if (!err) { const arr = Array.isArray(data) ? data : []; if (arr[0] && arr[0].sma) sma150 = arr[0].sma; }
+      doneOne();
+    });
+    fetchFMP(`/technical-indicators/sma?symbol=${t.symbol}&periodLength=200&timeframe=1day`, (err, data) => {
+      if (!err) {
+        const arr = Array.isArray(data) ? data : [];
+        if (arr.length >= 2) {
+          const latest = arr[0].sma, older = arr[Math.min(19, arr.length - 1)].sma;
+          if (latest && older) {
+            const slopePct = ((latest - older) / older) * 100;
+            sma200Slope = slopePct > 0.1 ? 'Rising' : slopePct < -0.1 ? 'Falling' : 'Flat';
+          }
+        }
+      }
+      doneOne();
+    });
+  }
+
+  if (!tickers.length) { callback({ results: [], passed: [], total: 0, passedCount: 0, errorCount: 0 }); return; }
+  const starters = Math.min(concurrency, tickers.length);
+  for (let i = 0; i < starters; i++) next();
+}
+
 // Real earnings calendar — replaces web-search guessing with an authoritative date/ticker list.
 // No LLM interpretation needed to know who reports when.
 function fmpEarningsCalendar(from, to, callback) {
@@ -602,6 +755,33 @@ const server = http.createServer((req, res) => {
   // conditions fetch, unlike the heavy RS universe build. ──
   if (req.method === 'GET' && req.url === '/fmp/breadth-check') {
     fmpBreadthCheck(json);
+    return;
+  }
+
+  // ── GET /fmp/sector-screen?sectors=Technology,Financial Services,Healthcare ──
+  // Bridges the manual Top-3-sectors step to a fully automated, tokenless broad screen:
+  // real FMP screener for liquid stocks (>$500M cap) in those sectors, then the actual
+  // Trend Template math run against every one of them in pure code. No LLM calls anywhere
+  // in this pipeline — heavy (up to ~400 tickers x 4 calls), so give it room to run.
+  if (req.method === 'GET' && req.url.startsWith('/fmp/sector-screen')) {
+    const qs = new URLSearchParams(req.url.split('?')[1] || '');
+    const sectors = (qs.get('sectors') || '').split(',').map(s => s.trim()).filter(Boolean).slice(0, 3);
+    if (!sectors.length) { json({ error: 'sectors query param required, e.g. ?sectors=Technology,Healthcare' }); return; }
+    fmpSectorScreener(sectors, (screenerResult) => {
+      if (!screenerResult.tickers || !screenerResult.tickers.length) {
+        json({ error: 'No tickers found for the given sectors', screenerResult });
+        return;
+      }
+      fmpBroadTrendTemplateScreen(screenerResult.tickers, (trendResult) => {
+        json({
+          sectorsRequested: sectors,
+          unrecognizedSectors: screenerResult.unrecognizedSectors,
+          universeSize: screenerResult.tickers.length,
+          screenerErrorCount: screenerResult.errorCount || 0,
+          ...trendResult
+        });
+      });
+    });
     return;
   }
 
